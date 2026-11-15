@@ -1,0 +1,173 @@
+name: Build OpenGMK_Builded for Windows
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "17 * * * *"
+
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      # 1. Descobrir a versão mais recente do OpenGMK original.
+      - name: Get latest OpenGMK commit
+        id: upstream
+        shell: pwsh
+        run: |
+          $result = git ls-remote https://github.com/OpenGMK/OpenGMK.git refs/heads/master
+
+          if ($LASTEXITCODE -ne 0 -or -not $result) {
+            throw "Could not get the latest OpenGMK commit."
+          }
+
+          $sha = ($result -split '\s+')[0]
+
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short_sha=$($sha.Substring(0, 7))" >> $env:GITHUB_OUTPUT
+          "tag=upstream-$sha" >> $env:GITHUB_OUTPUT
+
+      # 2. Verificar se essa versão já foi compilada.
+      - name: Check existing release
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+            "exists=true" >> $env:GITHUB_OUTPUT
+            Write-Host "This version was already released."
+          }
+          else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+            Write-Host "A new build is needed."
+          }
+
+      # 3. Baixar o código-fonte original.
+      - name: Checkout OpenGMK source
+        if: ${{ steps.check.outputs.exists == 'false' }}
+        uses: actions/checkout@v7
+        with:
+          repository: OpenGMK/OpenGMK
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: source
+          submodules: recursive
+          persist-credentials: false
+
+      # 4. Instalar Rust 1.77 e o compilador de 32 bits.
+      - name: Install Rust 1.77
+        if: ${{ steps.check.outputs.exists == 'false' }}
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.77 --profile minimal
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          rustup target add --toolchain 1.77 i686-pc-windows-msvc
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      # 5. Compilar o GM8Emulator de 64 bits.
+      - name: Build gm8emulator x64
+        if: ${{ steps.check.outputs.exists == 'false' }}
+        working-directory: source
+        shell: pwsh
+        run: |
+          cargo +1.77 build --locked --release -p gm8emulator
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      # 6. Compilar o servidor WoW64 de 32 bits.
+      - name: Build gm8emulator-wow64
+        if: ${{ steps.check.outputs.exists == 'false' }}
+        working-directory: source/gm8emulator-wow64
+        shell: pwsh
+        run: |
+          cargo +1.77 build --release --target=i686-pc-windows-msvc
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      # 7. Empacotar os dois executáveis.
+      - name: Package binaries
+        if: ${{ steps.check.outputs.exists == 'false' }}
+        shell: pwsh
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          $emulator = "source/target/release/gm8emulator.exe"
+
+          $wow64 = "source/gm8emulator-wow64/target/i686-pc-windows-msvc/release/gm8emulator-wow64.exe"
+
+          if (!(Test-Path $emulator)) {
+            throw "gm8emulator.exe was not generated."
+          }
+
+          if (!(Test-Path $wow64)) {
+            throw "gm8emulator-wow64.exe was not generated."
+          }
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          Copy-Item $emulator dist/
+          Copy-Item $wow64 dist/
+
+          @(
+            "OpenGMK_Builded automatic Windows build"
+            ""
+            "Original project: https://github.com/OpenGMK/OpenGMK"
+            "Upstream commit: $env:UPSTREAM_SHA"
+            "Source: https://github.com/OpenGMK/OpenGMK/commit/$env:UPSTREAM_SHA"
+            ""
+            "Components:"
+            "- gm8emulator.exe (x64)"
+            "- gm8emulator-wow64.exe (i686)"
+          ) | Set-Content -Path dist/BUILD-INFO.txt -Encoding utf8
+
+          Compress-Archive -Path "dist/*" -DestinationPath "OpenGMK_Builded-Windows-x64.zip" -Force
+
+          $hash = (Get-FileHash "OpenGMK_Builded-Windows-x64.zip" -Algorithm SHA256).Hash
+
+          "$hash OpenGMK_Builded-Windows-x64.zip" | Set-Content "OpenGMK_Builded-Windows-x64.zip.sha256"
+
+      # 8. Publicar a versão no GitHub Releases.
+      - name: Publish GitHub Release
+        if: ${{ steps.check.outputs.exists == 'false' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.upstream.outputs.tag }}
+          name: OpenGMK_Builded - ${{ steps.upstream.outputs.short_sha }}
+          body: |
+            Automatic Windows build of OpenGMK.
+
+            Original source:
+            https://github.com/OpenGMK/OpenGMK/commit/${{ steps.upstream.outputs.sha }}
+
+            Included executables:
+
+            - gm8emulator.exe (64-bit)
+            - gm8emulator-wow64.exe (32-bit)
+
+          files: |
+            OpenGMK_Builded-Windows-x64.zip
+            OpenGMK_Builded-Windows-x64.zip.sha256
+          fail_on_unmatched_files: true
